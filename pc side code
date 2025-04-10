@@ -1,1 +1,107 @@
 
+#include <winscard.h>
+#include <iostream>
+#include <vector>
+#include <fstream>
+
+int main() {
+    SCARDCONTEXT hContext;
+    LONG rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext);
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "Failed to establish context: " << rv << std::endl;
+        return 1;
+    }
+
+    DWORD readersLen;
+    rv = SCardListReadersW(hContext, NULL, NULL, &readersLen);
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "Failed to list readers: " << rv << std::endl;
+        return 1;
+    }
+
+    std::vector<wchar_t> readers(readersLen);
+    rv = SCardListReadersW(hContext, NULL, readers.data(), &readersLen);
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "Failed to list readers: " << rv << std::endl;
+        return 1;
+    }
+
+    wchar_t* readerName = readers.data();
+    std::wcout << L"Using reader: " << readerName << std::endl;
+
+    SCARDHANDLE hCard;
+    DWORD activeProtocol;
+    rv = SCardConnectW(hContext, readerName, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, &hCard, &activeProtocol);
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "Failed to connect to card: " << rv << std::endl;
+        return 1;
+    }
+
+    // SELECT AID APDU
+    BYTE selectAid[] = { 0x00, 0xA4, 0x04, 0x00, 0x07, 0xF0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
+    BYTE selectResponse[258];
+    DWORD selectResponseLen = sizeof(selectResponse);
+    SCARD_IO_REQUEST ioRecvPci = { SCARD_PROTOCOL_T1, sizeof(SCARD_IO_REQUEST) };
+
+    rv = SCardTransmit(hCard, SCARD_PCI_T1, selectAid, sizeof(selectAid), &ioRecvPci, selectResponse, &selectResponseLen);
+    if (rv != SCARD_S_SUCCESS) {
+        std::cerr << "SELECT AID failed: " << rv << std::endl;
+        return 1;
+    }
+
+    if (selectResponseLen >= 2 && selectResponse[selectResponseLen - 2] == 0x90 && selectResponse[selectResponseLen - 1] == 0x00) {
+        std::cout << "SELECT AID successful." << std::endl;
+    }
+    else {
+        std::cerr << "SELECT AID returned status: "
+            << std::hex << (int)selectResponse[selectResponseLen - 2] << " "
+            << (int)selectResponse[selectResponseLen - 1] << std::dec << std::endl;
+        return 1;
+    }
+
+    std::ofstream outputFile("received_file_android.bin", std::ios::binary);
+    if (!outputFile.is_open()) {
+        std::cerr << "Failed to open output file." << std::endl;
+        return 1;
+    }
+
+    BYTE recvBuffer[4096];
+    DWORD recvLength;
+
+    std::cout << "Waiting for APDU from Android..." << std::endl;
+
+    while (true) {
+        BYTE sendBuffer[2] = { 0x00, 0x00 }; // Dummy
+        recvLength = sizeof(recvBuffer);
+
+        rv = SCardTransmit(hCard, SCARD_PCI_T1, sendBuffer, 0, &ioRecvPci, recvBuffer, &recvLength);
+
+        if (rv != SCARD_S_SUCCESS) {
+            std::cerr << "SCardTransmit failed: " << rv << std::endl;
+            continue;
+        }
+
+        if (recvLength < 2) {
+            std::cerr << "Received short response." << std::endl;
+            continue;
+        }
+
+        BYTE sw1 = recvBuffer[recvLength - 2];
+        BYTE sw2 = recvBuffer[recvLength - 1];
+
+        if (sw1 == 0x90 && sw2 == 0x00) {
+            outputFile.write((char*)recvBuffer, recvLength - 2);
+            std::cout << "Received chunk: " << recvLength - 2 << " bytes" << std::endl;
+        }
+        else {
+            std::cout << "Received status: "
+                << std::hex << (int)sw1 << " " << (int)sw2 << std::dec << std::endl;
+        }
+    }
+
+    outputFile.close();
+    SCardDisconnect(hCard, SCARD_LEAVE_CARD);
+    SCardReleaseContext(hContext);
+
+    return 0;
+}
